@@ -32,6 +32,9 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 
+void lock_donate_priority (struct thread *doner, struct lock *lock);
+void lock_recall_priority (void);
+
 /* Initializes semaphore SEMA to VALUE.  A semaphore is a
    nonnegative integer along with two atomic operators for
    manipulating it:
@@ -113,12 +116,20 @@ sema_up (struct semaphore *sema)
   ASSERT (sema != NULL);
 
   old_level = intr_disable ();
-  if (!list_empty (&sema->waiters)) 
-    thread_unblock (list_entry (list_pop_front (&sema->waiters),
-                                struct thread, elem));
+
   sema->value++;
+
+  if (!list_empty (&sema->waiters)) 
+  {
+    struct thread *t = thread_highest_priority(&sema->waiters);
+    list_remove(&t->elem);
+    thread_unblock (t);
+   }
+
   intr_set_level (old_level);
 }
+
+
 
 static void sema_test_helper (void *sema_);
 
@@ -179,6 +190,7 @@ lock_init (struct lock *lock)
 
   lock->holder = NULL;
   sema_init (&lock->semaphore, 1);
+	sema_init( &lock->sema_lock, 1);
 }
 
 /* Acquires LOCK, sleeping until it becomes available if
@@ -196,8 +208,38 @@ lock_acquire (struct lock *lock)
   ASSERT (!intr_context ());
   ASSERT (!lock_held_by_current_thread (lock));
 
-  sema_down (&lock->semaphore);
+	if (!sema_try_down (&lock->semaphore))
+  	{
+			sema_down (&lock->sema_lock);
+			thread_current ()->wait_lock = lock;			
+			lock_donate_priority(thread_current(), lock);
+			sema_up (&lock->sema_lock);
+
+			sema_down (&lock->semaphore);
+		}
+
   lock->holder = thread_current ();
+  list_push_back (&(lock->holder->hold_locks), &lock->hold_elem);
+ 	
+	sema_down (&lock->sema_lock);
+	lock->holder->wait_lock = NULL;
+  sema_up (&lock->sema_lock);
+}
+
+/* Donate the priority to the lock holder when necessary */
+void lock_donate_priority (struct thread *doner, struct lock *lock) {
+  if (lock->holder == NULL) return;
+  struct thread *donee = lock->holder;
+	if (doner->priority > donee->priority)
+  {
+		donee->priority = doner->priority;
+		/* Pass down the priority */
+		while (donee->wait_lock) 
+		{
+			doner = donee;
+			lock_donate_priority(doner, doner->wait_lock);
+		}
+  }
 }
 
 /* Tries to acquires LOCK and returns true if successful or false
@@ -216,7 +258,10 @@ lock_try_acquire (struct lock *lock)
 
   success = sema_try_down (&lock->semaphore);
   if (success)
-    lock->holder = thread_current ();
+		{
+    	lock->holder = thread_current ();
+			list_push_back (&(lock->holder->hold_locks), &lock->hold_elem);
+		}
   return success;
 }
 
@@ -230,9 +275,36 @@ lock_release (struct lock *lock)
 {
   ASSERT (lock != NULL);
   ASSERT (lock_held_by_current_thread (lock));
-
+  	
+	list_pop_back(&(lock->holder->hold_locks));
+	lock_recall_priority();
   lock->holder = NULL;
   sema_up (&lock->semaphore);
+}
+
+void lock_recall_priority (void) 
+{
+	struct list_elem *e1, *e2;
+	struct thread *t_cur = thread_current();
+	/* Redo the priority donation for current thread (lock releaser) */
+	int highest_priority = t_cur->org_priority;
+  e1 = list_begin (&t_cur->hold_locks);
+	for (; e1 != list_end (&t_cur->hold_locks); e1 = list_next (e1))
+		{
+			struct lock *l = list_entry (e1, struct lock, hold_elem);
+			e2 = list_begin (&(l->semaphore.waiters));
+			for (; e2 != list_end (&(l->semaphore.waiters)); e2 = list_next (e2))
+			{
+				struct thread *doner = list_entry (e2, struct thread, elem);
+				if (doner->priority > highest_priority) 
+					highest_priority = doner->priority;
+			}
+		}
+	t_cur->priority = highest_priority;
+	/* Donate the recalled priority */
+	/*e1 = list_begin (&t_cur->wait_locks);
+	for (; e1 != list_end (&t_cur->wait_locks); e1 = list_next (e1))
+		lock_donate_priority (t_cur, list_entry (e1, struct lock, wait_elem));*/
 }
 
 /* Returns true if the current thread holds LOCK, false
